@@ -113,6 +113,7 @@ LICENSE                  Repository license
 Repository documentation is organized by function area. `authoritative` documents define development or collaboration requirements; `reference` documents provide background or an index.
 
 - [`docs/ai-passport-ble-protocol.md`](ai-passport-ble-protocol.md) — public BLE V1 service, messages, audio framing, lifecycle, and security boundaries.
+- [`docs/device-diagnostics.md`](device-diagnostics.md) — persistent numeric device events, bounded storage, USB export and decoding.
 - [`docs/THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — dependency versions, licenses, and redistribution notes.
 - [`docs/development/`](development/README.md) — engineering rules and reusable workflows: the `ai-guide.md`, `engineering/`, `ci/`, and `release/` areas. Its README lists them.
 - [`docs/contribution/`](contribution/README.md) — collaboration, documentation, and commit/PR conventions.

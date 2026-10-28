@@ -1,0 +1,2 @@
+#pragma once
+#define CONFIG_BT_NIMBLE_MSYS_1_BLOCK_SIZE 256

@@ -3,6 +3,7 @@
 #include "bsp_i2c.h"
 #include "esp_log.h"
 #include "esp_pm.h"
+#include "device_diag.h"
 #include "usb_standby.h"
 #include "lvgl.h"
 #include "nvs_flash.h"
@@ -24,6 +25,8 @@ void app_main(void)
 #endif
     // Hold the USB console awake before any idle task can reach light sleep.
     usb_standby_init();
+    esp_err_t diag_err = device_diag_init();
+    if (diag_err != ESP_OK) ESP_LOGW(TAG, "Persistent diagnostics unavailable: %s", esp_err_to_name(diag_err));
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());

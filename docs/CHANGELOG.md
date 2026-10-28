@@ -6,6 +6,14 @@
 
 ## Unreleased
 
+- Request a fixed 15 ms BLE interval for the 20 ms audio cadence instead of allowing Windows to retain 30 ms. Record separate MSYS pool snapshots so an exhausted ATT-header pool is distinguishable from audio-payload exhaustion. Keep retry deadlines, buffer counts and BLE V1 unchanged; verify the central's actual interval and repeat device voice acceptance.
+
+- Allocate audio from the existing larger MSYS pool with explicit header room, preserving the smaller pool for control and RX. Fix allocation failures with unused large blocks caused by the zero-size best-fit helper; retain the 12/24 buffer counts and existing retry limits. Add ownership/capacity regression tests and validate the pinned pool configuration.
+
+- Cancel failed captures with a retried session-scoped error instead of submitting truncated audio; disconnect only the affected link if terminal delivery fails. Gate a new UP start until the preceding host result completes. Defer all diagnostic Flash I/O until audio is idle, use a bounded 192-record queue, and record allocation-vs-stack failures, MSYS headroom, blocked starts and terminal delivery. Retain the 80 ms audio retry bound and BLE V1 wire format; long recordings and Windows acceptance require device checks.
+
+- Keep a bounded 256 KiB on-device diagnostic journal with explicit PTT stop sources, button/host/link events, audio timing and enqueue errors. CRC-committed records survive resets and rotate by sector; idle-only writes/erases and numeric-only metadata bound the cost. Add USB export/decoding, journal/decoder tests and a checked header install payload; preserve the 3 MiB app, identity and Recovery contracts. Long-term timing and power impact remain hardware checks.
+
 - Retry temporarily rejected BLE audio notifications for at most 80 ms without duplicating accepted frames, and send PTT lifecycle notifications from the audio worker with a 200 ms bound. Count audio sequences only after successful enqueue, cancel stale retries after reconnection/session changes, request 15-30 ms connection intervals and longer link-layer packets, and log negotiated link parameters and precise transport failures. An explicit host error stops abandoned microphone capture. Windows throughput and end-to-end voice acceptance remain device checks.
 
 - Explicitly mute and power down the speaker DAC before pausing its clocks, while keeping microphone bias/filter state. A zero playback volume now disables the output; only deliberate playback can re-enable it with a running stream. Verify output registers and keep the stream awake for retry if the transition fails. This addresses an unsafe idle-output path identified while investigating intermittent post-flash noise; acoustic reproduction remains a device check.

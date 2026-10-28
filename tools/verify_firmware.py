@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import struct
 import sys
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -103,6 +104,19 @@ def verify_recovery_contract(merged: bytes, build_dir: Path) -> None:
             raise ValueError(f"partition {item.label!r} overlaps permanent Recovery")
 
     app_path = build_dir / "FoloToy-AI-Passport.bin"
+    diagnostic = by_label.get("diag_log")
+    if diagnostic is not None:
+        if diagnostic != Partition(1, 0x40, 0x310000, 0x40000, "diag_log"):
+            raise ValueError("diagnostic journal must use its reserved gap before cardid")
+        seed = (build_dir / "diag_log_seed.bin").read_bytes()
+        expected_header = struct.pack("<IHHII11I", 0x314A4456, 1, 64, 4096, 0x40000, *([0] * 11))
+        expected_header += struct.pack("<I", zlib.crc32(expected_header))
+        if seed != expected_header or merged[diagnostic.offset:diagnostic.offset + 64] != seed:
+            raise ValueError("merged diagnostic header is missing or invalid")
+        payload = merged[diagnostic.offset + 64:min(len(merged), diagnostic.end)]
+        if any(byte != 0xFF for byte in payload):
+            raise ValueError("merged artifact must not contain runtime diagnostic records")
+        print("Diagnostic header and runtime-log exclusion: PASS")
     app_size = app_path.stat().st_size
     if app_size > APP_MAX_SIZE:
         raise ValueError(f"application is {app_size} bytes; BLE limit is {APP_MAX_SIZE}")

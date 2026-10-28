@@ -66,6 +66,19 @@ run_static_checks() {
         tests/test_ble_tx_retry.c main/ble_tx_retry.c \
         -o "${test_dir}/test_ble_tx_retry"
     "${test_dir}/test_ble_tx_retry"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_ble_capture_end.c main/ble_capture_end.c \
+        -o "${test_dir}/test_ble_capture_end"
+    "${test_dir}/test_ble_capture_end"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Itests/ble_mbuf_stubs -Imain \
+        tests/test_ble_audio_mbuf.c main/ble_audio_mbuf.c \
+        -o "${test_dir}/test_ble_audio_mbuf"
+    "${test_dir}/test_ble_audio_mbuf"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_diag_journal.c main/diag_journal.c \
+        -o "${test_dir}/test_diag_journal"
+    "${test_dir}/test_diag_journal"
+    python3 tests/test_device_diagnostics.py
     python3 tests/test_verify_firmware.py
     rm -rf "${test_dir}"
     echo "Host tests: PASS"
@@ -97,6 +110,8 @@ required = {
     "CONFIG_BT_CTRL_MAIN_XTAL_PU_DURING_LIGHT_SLEEP=y", "CONFIG_ESP_PHY_MAC_BB_PD=y",
     "CONFIG_BUTTON_PERIOD_TIME_MS=20", "CONFIG_BUTTON_DEBOUNCE_TICKS=1",
     "CONFIG_BUTTON_LONG_PRESS_TIME_MS=650",
+    "CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=12", "CONFIG_BT_NIMBLE_MSYS_1_BLOCK_SIZE=256",
+    "CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=24", "CONFIG_BT_NIMBLE_MSYS_2_BLOCK_SIZE=320",
 }
 missing = required - config
 if missing:

@@ -6,6 +6,9 @@
 #include "bsp_button.h"
 #include "button_gesture.h"
 #include "ble_tx_retry.h"
+#include "ble_capture_end.h"
+#include "ble_audio_mbuf.h"
+#include "device_diag.h"
 #include "esp_timer.h"
 #include "cJSON.h"
 #include "esp_log.h"
@@ -22,6 +25,7 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "os/os_mbuf.h"
+#include "os/os_mempool.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include <stdio.h>
@@ -59,6 +63,8 @@ static volatile bool s_audio_subscribed;
 static volatile bool s_host_ready;
 static volatile bool s_recording;
 static volatile bool s_stop_requested;
+static volatile bool s_result_pending;
+static volatile bool s_finishing;
 static volatile uint32_t s_session;
 static volatile uint32_t s_control_seq;
 static volatile uint32_t s_button_seq;
@@ -70,11 +76,76 @@ static volatile uint32_t s_connection_epoch = 1;
 static bool s_hello_sent;
 static bool s_link_parameters_requested;
 static uint32_t s_tx_retries;
+static volatile uint32_t s_stop_reason;
+static volatile uint32_t s_queued_frames;
+static uint32_t s_last_retry_diag_ms;
+static uint32_t s_tx_alloc_failures, s_tx_stack_failures;
+static uint16_t s_msys_min_free;
 #define BUTTON_LONG_PRESS_MS CONFIG_BUTTON_LONG_PRESS_TIME_MS
 
 static bool host_is_ready(void)
 {
     return s_conn != NO_CONN && s_host_ready;
+}
+
+static uint32_t diagnostic_flags(void)
+{
+    return s_recording | (s_stop_requested << 1) | (s_host_ready << 2) |
+           (s_control_subscribed << 3) | (s_audio_subscribed << 4) |
+           (s_result_pending << 5) | (s_finishing << 6);
+}
+
+static void diagnostic_resources(uint32_t session, uint32_t stage, uint16_t handle,
+                                 int rc, uint16_t free_blocks)
+{
+    device_diag_emit(DD_TX_RESOURCES, session, stage, handle, rc,
+                     free_blocks | ((uint32_t)s_msys_min_free << 16),
+                     s_tx_alloc_failures, s_tx_stack_failures, s_queued_frames, s_connection_epoch);
+    // Aggregate MSYS free space cannot distinguish an exhausted ATT-header pool
+    // from an exhausted audio pool. Pools remain registered for this app's life;
+    // snapshots are diagnostic observations, never a resource reservation.
+    uint32_t pools[8] = {UINT32_MAX, UINT32_MAX, 0, 0, UINT32_MAX, UINT32_MAX, 0, 0};
+    struct os_mempool *cursor = NULL;
+    struct os_mempool_info info;
+    while ((cursor = os_mempool_info_get_next(cursor, &info)) != NULL) {
+        const int index = !strcmp(info.omi_name, "msys_1") ? 0 :
+                          !strcmp(info.omi_name, "msys_2") ? 4 : -1;
+        if (index < 0) continue;
+        pools[index] = info.omi_num_free;
+        pools[index + 1] = info.omi_min_free;
+        pools[index + 2] = info.omi_num_blocks;
+        pools[index + 3] = info.omi_block_size;
+    }
+    device_diag_emit(DD_MSYS_POOLS, session, pools[0], pools[1], pools[2], pools[3],
+                     pools[4], pools[5], pools[6], pools[7]);
+}
+
+static void diagnostic_stats(uint32_t session, uint32_t frames, uint32_t read_us,
+                             uint32_t tx_ms, uint32_t gap_ms)
+{
+    device_diag_emit(DD_AUDIO_STATS, session, frames, s_tx_retries, read_us, tx_ms,
+                     gap_ms, esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
+                     uxTaskGetStackHighWaterMark(NULL));
+    diagnostic_resources(session, 0, s_audio_handle, 0, os_msys_num_free());
+}
+
+static uint32_t diagnostic_message(const cJSON *message, uint32_t *length, uint32_t *category)
+{
+    *length = 0; *category = 0;
+    if (!cJSON_IsString(message)) return 0;
+    const char *text = message->valuestring;
+    // Numeric fingerprints only; never persist arbitrary host text.
+    if (strstr(text, "stall")) *category |= 1;
+    if (strstr(text, "timed out") || strstr(text, "timeout")) *category |= 2;
+    if (strstr(text, "cancel")) *category |= 4;
+    if (strstr(text, "WebSocket")) *category |= 8;
+    if (strstr(text, "audio")) *category |= 16;
+    uint32_t hash = 2166136261u;
+    while (text[*length] && *length < MAX_CONTROL) {
+        hash = (hash ^ (uint8_t)text[*length]) * 16777619u;
+        ++*length;
+    }
+    return hash;
 }
 
 static int notify_control(const char *json);
@@ -97,7 +168,9 @@ static void send_button_event(bsp_btn_t button, const char *event,
              "{\"v\":1,\"type\":\"button_event\",\"button\":\"%s\",\"event\":\"%s\",\"durationMs\":%lu,\"seq\":%lu}",
              button_name(button), event, (unsigned long)duration_ms,
              (unsigned long)++s_button_seq);
-    (void)notify_control(json);
+    int rc = notify_control(json);
+    device_diag_emit(DD_BUTTON_SEND, s_session, button, !strcmp(event, "long"), duration_ms,
+                     rc, s_button_seq, diagnostic_flags(), s_connection_epoch, 0);
 }
 
 static void button_cb(bsp_btn_t button, bsp_btn_ev_t event, void *user);
@@ -125,7 +198,11 @@ static int notify_control(const char *json)
     size_t len = strlen(json);
     if (len == 0 || len > MAX_CONTROL) return BLE_HS_EMSGSIZE;
     int rc = notify_bytes(s_control_handle, (const uint8_t *)json, len);
-    if (rc != 0) ESP_LOGW(TAG, "Control enqueue failed rc=%d mtu=%u", rc, ble_att_mtu(s_conn));
+    if (rc != 0) {
+        device_diag_emit(DD_TX_FAILURE, s_session, s_control_handle, rc, 1, 0,
+                         diagnostic_flags(), s_connection_epoch, esp_get_free_heap_size(), 0);
+        ESP_LOGW(TAG, "Control enqueue failed rc=%d mtu=%u", rc, ble_att_mtu(s_conn));
+    }
     return rc;
 }
 
@@ -137,6 +214,8 @@ typedef struct {
     const uint8_t *data;
     size_t len;
     bool require_recording;
+    uint32_t failure_stage;
+    uint16_t free_blocks;
 } tx_context_t;
 
 static bool tx_valid(void *arg)
@@ -150,13 +229,25 @@ static bool tx_valid(void *arg)
 
 static int tx_once(void *arg)
 {
-    const tx_context_t *tx = arg;
+    tx_context_t *tx = arg;
     if (!tx_valid(arg)) return BLE_HS_ENOTCONN;
     if (tx->len > ble_att_mtu(tx->conn) - 3) return BLE_HS_EMSGSIZE;
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(tx->data, tx->len);
-    if (!om) return BLE_HS_ENOMEM;
+    tx->free_blocks = os_msys_num_free();
+    if (tx->free_blocks < s_msys_min_free) s_msys_min_free = tx->free_blocks;
+    struct os_mbuf *om = tx->handle == s_audio_handle ?
+        ble_audio_mbuf_from_flat(tx->data, tx->len) : ble_hs_mbuf_from_flat(tx->data, tx->len);
+    if (!om) {
+        tx->failure_stage = 1;
+        ++s_tx_alloc_failures;
+        return BLE_HS_ENOMEM;
+    }
     // NimBLE consumes om on both success and failure. Allocate anew per attempt.
-    return ble_gatts_notify_custom(tx->conn, tx->handle, om);
+    const int rc = ble_gatts_notify_custom(tx->conn, tx->handle, om);
+    if (rc != 0) {
+        tx->failure_stage = 2;
+        ++s_tx_stack_failures;
+    }
+    return rc;
 }
 
 static bool tx_retryable(int rc)
@@ -180,12 +271,22 @@ static int notify_worker(uint16_t handle, const uint8_t *data, size_t len,
                          uint32_t session, uint32_t epoch, bool require_recording,
                          uint32_t timeout_ms)
 {
-    tx_context_t tx = {s_conn, handle, epoch, session, data, len, require_recording};
+    tx_context_t tx = {.conn = s_conn, .handle = handle, .epoch = epoch, .session = session,
+                       .data = data, .len = len, .require_recording = require_recording};
     const ble_tx_retry_ops_t ops = {&tx, tx_valid, tx_once, tx_retryable, tx_now_ms, tx_wait_ms};
     const ble_tx_retry_result_t result = ble_tx_retry_send(&ops, timeout_ms, TX_RETRY_INTERVAL_MS);
     if (result.attempts > 1) s_tx_retries += result.attempts - 1;
+    const uint32_t retry_now = tx_now_ms(NULL);
+    if (result.attempts > 1 && retry_now - s_last_retry_diag_ms >= 5000) {
+        s_last_retry_diag_ms = retry_now;
+        device_diag_emit(DD_TX_RETRY, session, handle, result.code, result.attempts,
+                         result.elapsed_ms, result.cancelled, epoch, s_queued_frames, 0);
+    }
     if (result.cancelled) return BLE_HS_ENOTCONN;
     if (result.code != 0) {
+        diagnostic_resources(session, tx.failure_stage, handle, result.code, tx.free_blocks);
+        device_diag_emit(DD_TX_FAILURE, session, handle, result.code, result.attempts,
+                         result.elapsed_ms, diagnostic_flags(), epoch, esp_get_free_heap_size(), s_queued_frames);
         ESP_LOGE(TAG, "TX failed session=%lu handle=%u rc=%d attempts=%lu wait_ms=%lu mtu=%u heap=%lu",
                  (unsigned long)session, handle, result.code, (unsigned long)result.attempts,
                  (unsigned long)result.elapsed_ms, ble_att_mtu(tx.conn),
@@ -207,6 +308,11 @@ static void log_link(const char *event)
 {
     struct ble_gap_conn_desc desc;
     if (s_conn != NO_CONN && ble_gap_conn_find(s_conn, &desc) == 0) {
+        const uint32_t origin = !strcmp(event, "Connected") ? 1 :
+            !strcmp(event, "Host link") ? 2 : !strcmp(event, "Capture link") ? 3 : 4;
+        device_diag_emit(DD_LINK, s_session, origin, s_conn, ble_att_mtu(s_conn),
+                         desc.conn_itvl * 1250u, desc.conn_latency,
+                         desc.supervision_timeout * 10u, s_connection_epoch, diagnostic_flags());
         ESP_LOGI(TAG, "%s conn=%u mtu=%u interval_us=%lu latency=%u supervision_ms=%lu",
                  event, s_conn, ble_att_mtu(s_conn), (unsigned long)desc.conn_itvl * 1250,
                  desc.conn_latency, (unsigned long)desc.supervision_timeout * 10);
@@ -218,23 +324,76 @@ static void request_audio_link(void)
     if (s_link_parameters_requested || s_conn == NO_CONN) return;
     s_link_parameters_requested = true;
     const struct ble_gap_upd_params params = {
-        .itvl_min = 12, .itvl_max = 24, .latency = 0,
+        .itvl_min = 12, .itvl_max = 12, .latency = 0,
         .supervision_timeout = 400, .min_ce_len = 0, .max_ce_len = 0,
     };
-    // Request 15-30 ms connection events for 20 ms voice frames. The central
-    // retains final control; a refusal is diagnostic, never a handshake failure.
+    // Request 15 ms explicitly: the previous 15-30 ms range let Windows keep
+    // 30 ms, which exhausted TX buffers with a 20 ms audio cadence on this host.
+    // The central retains final control; always log the negotiated interval.
     int rc = ble_gap_update_params(s_conn, &params);
-    ESP_LOGI(TAG, "Audio link parameter request rc=%d target_interval_us=15000..30000", rc);
+    device_diag_emit(DD_LINK_REQUEST, s_session, 1, rc, s_conn, 15000, 15000, s_connection_epoch, 0, 0);
+    ESP_LOGI(TAG, "Audio link parameter request rc=%d target_interval_us=15000", rc);
     rc = ble_gap_set_data_len(s_conn, 251, 2120);
+    device_diag_emit(DD_LINK_REQUEST, s_session, 2, rc, s_conn, 251, 2120, s_connection_epoch, 0, 0);
     ESP_LOGI(TAG, "Audio link data length request rc=%d tx_octets=251", rc);
 }
 
-static void send_error(uint32_t session, const char *message)
+typedef struct {
+    uint32_t session, epoch, frames;
+    uint16_t conn;
+    const char *error;
+} capture_end_context_t;
+
+static bool capture_end_valid(void *arg)
 {
+    const capture_end_context_t *end = arg;
+    return end->conn != NO_CONN && end->conn == s_conn &&
+           end->epoch == s_connection_epoch && end->session == s_session;
+}
+
+static int capture_end_notify(void *arg, bool submit)
+{
+    const capture_end_context_t *end = arg;
     char json[MAX_CONTROL + 1];
-    snprintf(json, sizeof(json), "{\"v\":1,\"type\":\"device_error\",\"sessionId\":%lu,\"message\":\"%s\"}",
-             (unsigned long)session, message);
-    (void)notify_control(json);
+    if (submit) {
+        snprintf(json, sizeof(json), "{\"v\":1,\"type\":\"ptt_up\",\"sessionId\":%lu,\"seq\":%lu,\"finalSequence\":%lu}",
+                 (unsigned long)end->session, (unsigned long)++s_control_seq,
+                 end->frames ? (unsigned long)(end->frames - 1) : EMPTY_FINAL_SEQUENCE);
+    } else {
+        snprintf(json, sizeof(json), "{\"v\":1,\"type\":\"device_error\",\"sessionId\":%lu,\"message\":\"%s\"}",
+                 (unsigned long)end->session, end->error);
+    }
+    return notify_control_worker(json, end->session, end->epoch, false);
+}
+
+static int capture_end_disconnect(void *arg)
+{
+    const capture_end_context_t *end = arg;
+    return ble_gap_terminate(end->conn, BLE_ERR_REM_USER_CONN_TERM);
+}
+
+static int finish_capture(uint32_t session, uint32_t epoch, uint32_t frames, const char *error)
+{
+    capture_end_context_t end = {session, epoch, frames, s_conn, error};
+    const ble_capture_end_ops_t ops = {&end, capture_end_valid, capture_end_notify, capture_end_disconnect};
+    if (!capture_end_valid(&end)) return BLE_HS_ENOTCONN;
+    s_finishing = true;
+    s_result_pending = true;
+    s_recording = false;
+    s_stop_requested = false;
+    const ble_capture_end_result_t result = ble_capture_end(&ops, error == NULL);
+    device_diag_emit(DD_END_DELIVERY, session, error != NULL, result.notify_rc,
+                     result.cancelled, result.disconnect_requested, result.disconnect_rc,
+                     frames, epoch, diagnostic_flags());
+    if (capture_end_valid(&end)) s_finishing = false;
+    return result.cancelled ? BLE_HS_ENOTCONN : result.notify_rc;
+}
+
+static void capture_error_ui(uint32_t session, uint32_t epoch, const char *message)
+{
+    // Terminal delivery can yield to a reconnect or a new request.
+    if (session == s_session && epoch == s_connection_epoch && s_conn != NO_CONN && !s_recording)
+        ui_status_set_state(UI_STATUS_ERROR, message);
 }
 
 static int ima_index_table[16] = {-1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8};
@@ -302,6 +461,7 @@ static bool boot_recording_requested(void)
 static void audio_task(void *arg)
 {
     (void)arg;
+    device_diag_audio_enter();
     // Runs once per boot, outside button/LVGL callbacks. Keep the existing
     // microphone format and prioritize a voice request over the startup sound.
     esp_err_t boot_err = bsp_audio_set_format(16000, 16, 1);
@@ -320,30 +480,64 @@ static void audio_task(void *arg)
     uint32_t capture_session = 0;
     uint32_t capture_epoch = 0;
     uint32_t stats_ms = 0;
+    uint32_t diag_ms = 0, capture_ms = 0, last_frame_ms = 0;
+    uint32_t max_read_us = 0, max_tx_ms = 0, max_gap_ms = 0;
+    bool end_logged = false;
+    uint32_t idle_pause_failures = 0, idle_error_ms = 0;
     bool capturing = false;
     for (;;) {
         if (!s_recording) {
+            if (capturing && !end_logged) {
+                device_diag_emit(DD_CAPTURE_ABORT, capture_session, s_stop_reason, sequence,
+                                 s_tx_retries, capture_epoch, s_connection_epoch, s_session,
+                                 diagnostic_flags(), tx_now_ms(NULL) - capture_ms);
+                diagnostic_stats(capture_session, sequence, max_read_us, max_tx_ms, max_gap_ms);
+            }
             capturing = false;
             sequence = 0;
             // A failed pause keeps the affected I2S channel and its sleep lock
             // held; retry after a short pause instead of aborting the device.
             // A capture request that arrives during the retry is picked up by
             // the loop condition, so no notification is lost.
-            if (bsp_audio_pause() != ESP_OK) {
+            const int64_t idle_pause_start = esp_timer_get_time();
+            const esp_err_t idle_pause_rc = bsp_audio_pause();
+            if (idle_pause_rc != ESP_OK) {
+                ++idle_pause_failures;
+                if (idle_pause_failures == 1 || tx_now_ms(NULL) - idle_error_ms >= 10000) {
+                    idle_error_ms = tx_now_ms(NULL);
+                    device_diag_emit(DD_MIC_ERROR, capture_session, DD_REASON_AUDIO_PAUSE,
+                                     idle_pause_rc, (uint32_t)(esp_timer_get_time() - idle_pause_start),
+                                     diagnostic_flags(), idle_pause_failures, capture_epoch, 0, 0);
+                }
                 ESP_LOGE(TAG, "I2S pause failed; retrying");
                 vTaskDelay(pdMS_TO_TICKS(100));
                 continue;
             }
+            idle_pause_failures = 0;
+            device_diag_audio_idle();
             // A request during pause leaves a pending notification. Do not
             // clear notifications separately from this atomic wait.
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
         }
         if (!capturing || capture_session != s_session || capture_epoch != s_connection_epoch) {
+            if (capturing && !end_logged) {
+                device_diag_emit(DD_CAPTURE_ABORT, capture_session, DD_REASON_SESSION_CHANGED,
+                                 sequence, s_tx_retries, capture_epoch, s_connection_epoch,
+                                 s_session, diagnostic_flags(), tx_now_ms(NULL) - capture_ms);
+                diagnostic_stats(capture_session, sequence, max_read_us, max_tx_ms, max_gap_ms);
+            }
+            device_diag_audio_enter();
             capture_session = s_session;
             capture_epoch = s_connection_epoch;
             sequence = 0;
             s_tx_retries = 0;
+            s_tx_alloc_failures = 0; s_tx_stack_failures = 0;
+            s_msys_min_free = os_msys_num_free();
+            s_queued_frames = 0;
+            max_read_us = 0; max_tx_ms = 0; max_gap_ms = 0;
+            capture_ms = tx_now_ms(NULL); last_frame_ms = capture_ms; diag_ms = capture_ms;
+            end_logged = false;
             char start_json[MAX_CONTROL + 1];
             snprintf(start_json, sizeof(start_json),
                      "{\"v\":1,\"type\":\"ptt_down\",\"sessionId\":%lu,\"seq\":0}",
@@ -351,92 +545,142 @@ static void audio_task(void *arg)
             // Retry in the audio worker; button and NimBLE callbacks never wait.
             int start_rc = notify_control_worker(start_json, capture_session, capture_epoch, true);
             if (start_rc != 0) {
+                device_diag_emit(DD_CAPTURE_ABORT, capture_session, DD_REASON_START_TX,
+                                 0, s_tx_retries, capture_epoch, s_connection_epoch, s_session,
+                                 diagnostic_flags(), tx_now_ms(NULL) - capture_ms);
+                end_logged = true;
                 if (s_recording && capture_session == s_session && capture_epoch == s_connection_epoch) {
-                    s_recording = false;
-                    s_stop_requested = false;
-                    ui_status_set_state(UI_STATUS_ERROR, "BLE send failed");
+                    s_stop_reason = DD_REASON_START_TX;
+                    (void)finish_capture(capture_session, capture_epoch, 0, "start_tx");
+                    capture_error_ui(capture_session, capture_epoch, "BLE send failed");
                 }
                 continue;
             }
             stats_ms = tx_now_ms(NULL);
+            device_diag_emit(DD_CAPTURE_START, capture_session, capture_epoch, diagnostic_flags(),
+                             esp_get_free_heap_size(), stats_ms - capture_ms, 0, 0, 0, 0);
             ESP_LOGI(TAG, "Capture start session=%lu epoch=%lu", (unsigned long)capture_session,
                      (unsigned long)capture_epoch);
             log_link("Capture link");
             // Pause also resets DMA between sessions; a failure returns to
             // idle so the next press can retry instead of rebooting.
-            if (bsp_audio_pause() != ESP_OK) {
+            const int64_t pause_start = esp_timer_get_time();
+            esp_err_t audio_rc = bsp_audio_pause();
+            if (audio_rc != ESP_OK) {
+                device_diag_emit(DD_MIC_ERROR, capture_session, DD_REASON_AUDIO_PAUSE, audio_rc,
+                                 (uint32_t)(esp_timer_get_time() - pause_start), capture_epoch, 0, 0, 0, 0);
                 if (s_recording && capture_session == s_session && capture_epoch == s_connection_epoch) {
-                    s_recording = false;
-                    s_stop_requested = false;
-                    send_error(capture_session, "audio_pause");
-                    ui_status_set_state(UI_STATUS_ERROR, "Microphone unavailable");
+                    s_stop_reason = DD_REASON_AUDIO_PAUSE;
+                    device_diag_emit(DD_CAPTURE_ABORT, capture_session, s_stop_reason, sequence,
+                                     s_tx_retries, capture_epoch, s_connection_epoch, s_session,
+                                     diagnostic_flags(), tx_now_ms(NULL) - capture_ms);
+                    end_logged = true;
+                    (void)finish_capture(capture_session, capture_epoch, sequence, "audio_pause");
+                    capture_error_ui(capture_session, capture_epoch, "Microphone unavailable");
                 }
                 continue;
             }
-            if (bsp_audio_set_format(16000, 16, 1) != ESP_OK) {
+            const int64_t open_start = esp_timer_get_time();
+            audio_rc = bsp_audio_set_format(16000, 16, 1);
+            if (audio_rc != ESP_OK) {
+                device_diag_emit(DD_MIC_ERROR, capture_session, DD_REASON_AUDIO_OPEN, audio_rc,
+                                 (uint32_t)(esp_timer_get_time() - open_start), capture_epoch, 0, 0, 0, 0);
                 if (s_recording && capture_session == s_session && capture_epoch == s_connection_epoch) {
-                    s_recording = false;
-                    s_stop_requested = false;
-                    send_error(capture_session, "audio_open");
-                    ui_status_set_state(UI_STATUS_ERROR, "Microphone unavailable");
+                    s_stop_reason = DD_REASON_AUDIO_OPEN;
+                    device_diag_emit(DD_CAPTURE_ABORT, capture_session, s_stop_reason, sequence,
+                                     s_tx_retries, capture_epoch, s_connection_epoch, s_session,
+                                     diagnostic_flags(), tx_now_ms(NULL) - capture_ms);
+                    end_logged = true;
+                    (void)finish_capture(capture_session, capture_epoch, sequence, "audio_open");
+                    capture_error_ui(capture_session, capture_epoch, "Microphone unavailable");
                 }
                 continue;
             }
             capturing = true;
         }
         if (!s_recording || capture_session != s_session || capture_epoch != s_connection_epoch) continue;
-        if (bsp_audio_read(pcm, sizeof(pcm)) != ESP_OK) {
+        const int64_t read_start = esp_timer_get_time();
+        esp_err_t read_rc = bsp_audio_read(pcm, sizeof(pcm));
+        const uint32_t read_us = (uint32_t)(esp_timer_get_time() - read_start);
+        if (read_us > max_read_us) max_read_us = read_us;
+        if (read_rc != ESP_OK) {
+            device_diag_emit(DD_MIC_ERROR, capture_session, DD_REASON_AUDIO_READ, read_rc,
+                             read_us, sequence, diagnostic_flags(), capture_epoch, 0, 0);
             if (s_recording && capture_session == s_session && capture_epoch == s_connection_epoch) {
-                s_stop_requested = false;
-                send_error(capture_session, "audio_read");
-                s_recording = false;
-                ui_status_set_state(UI_STATUS_ERROR, "Microphone unavailable");
+                s_stop_reason = DD_REASON_AUDIO_READ;
+                (void)finish_capture(capture_session, capture_epoch, sequence, "audio_read");
+                capture_error_ui(capture_session, capture_epoch, "Microphone unavailable");
             }
             continue;
         }
         // A disconnect or a new session during blocking I/O invalidates PCM.
         if (!s_recording || capture_session != s_session || capture_epoch != s_connection_epoch) continue;
         if (!s_audio_subscribed || ble_att_mtu(s_conn) < 185) {
-            s_stop_requested = false; send_error(s_session, "mtu");
-            s_recording = false;
-            ui_status_set_state(UI_STATUS_ERROR, "BLE audio unavailable");
+            device_diag_emit(DD_CAPTURE_ABORT, capture_session, DD_REASON_MTU, sequence, s_tx_retries,
+                             capture_epoch, s_connection_epoch, s_session, diagnostic_flags(), tx_now_ms(NULL) - capture_ms);
+            end_logged = true;
+            s_stop_reason = DD_REASON_MTU;
+            (void)finish_capture(capture_session, capture_epoch, sequence, "mtu");
+            capture_error_ui(capture_session, capture_epoch, "BLE audio unavailable");
             continue;
         }
         size_t encoded_len = encode_adpcm(pcm, encoded);
+        const uint32_t tx_start = tx_now_ms(NULL);
         int tx_rc = notify_audio(capture_session, capture_epoch, sequence, encoded, encoded_len);
+        const uint32_t tx_ms = tx_now_ms(NULL) - tx_start;
+        if (tx_ms > max_tx_ms) max_tx_ms = tx_ms;
         // A reconnect/new request invalidates this worker's old frame and state.
         if (capture_session != s_session || capture_epoch != s_connection_epoch || !s_recording) continue;
         if (tx_rc != 0) {
-            s_stop_requested = true;
+            s_stop_reason = DD_REASON_TRANSPORT;
             ESP_LOGE(TAG, "Capture transport failure session=%lu next_sequence=%lu rc=%d retries=%lu",
                      (unsigned long)capture_session, (unsigned long)sequence, tx_rc,
                      (unsigned long)s_tx_retries);
-            send_error(capture_session, "transport");
-            s_recording = false;
-            ui_status_set_state(UI_STATUS_ERROR, "BLE send failed");
+            // A transport failure is cancellation, never a normal ptt_up.
+            // Keep the same epoch/session while the error notification retries.
+            (void)finish_capture(capture_session, capture_epoch, sequence, "transport");
+            device_diag_emit(DD_CAPTURE_ABORT, capture_session, DD_REASON_TRANSPORT, sequence,
+                             s_tx_retries, capture_epoch, s_connection_epoch, s_session,
+                             diagnostic_flags(), tx_now_ms(NULL) - capture_ms);
+            diagnostic_stats(capture_session, sequence, max_read_us, max_tx_ms, max_gap_ms);
+            end_logged = true;
+            capture_error_ui(capture_session, capture_epoch, "BLE send failed");
+            continue;
         } else {
             ++sequence;
+            s_queued_frames = sequence;
+            const uint32_t frame_ms = tx_now_ms(NULL);
+            const uint32_t gap = frame_ms - last_frame_ms;
+            if (sequence > 1 && gap > max_gap_ms) max_gap_ms = gap;
+            last_frame_ms = frame_ms;
+            if (sequence == 1) device_diag_emit(DD_FIRST_FRAME, capture_session,
+                frame_ms - capture_ms, read_us, tx_ms, capture_epoch, 0, 0, 0, 0);
         }
         if (tx_now_ms(NULL) - stats_ms >= 1000) {
-            ESP_LOGI(TAG, "Capture stats session=%lu queued_frames=%lu retries=%lu",
+            ESP_LOGD(TAG, "Capture stats session=%lu queued_frames=%lu retries=%lu",
                      (unsigned long)capture_session, (unsigned long)sequence, (unsigned long)s_tx_retries);
             stats_ms = tx_now_ms(NULL);
         }
+        if (tx_now_ms(NULL) - diag_ms >= 10000) {
+            diagnostic_stats(capture_session, sequence, max_read_us, max_tx_ms, max_gap_ms);
+            diag_ms = tx_now_ms(NULL);
+        }
         if (s_stop_requested) {
-            char json[MAX_CONTROL + 1];
-            snprintf(json, sizeof(json), "{\"v\":1,\"type\":\"ptt_up\",\"sessionId\":%lu,\"seq\":%lu,\"finalSequence\":%lu}",
-                     (unsigned long)capture_session, (unsigned long)++s_control_seq,
-                     sequence ? (unsigned long)(sequence - 1) : EMPTY_FINAL_SEQUENCE);
-            int stop_rc = notify_control_worker(json, capture_session, capture_epoch, false);
+            const uint32_t stop_reason = s_stop_reason;
+            int stop_rc = finish_capture(capture_session, capture_epoch, sequence, NULL);
+            device_diag_emit(DD_CAPTURE_STOP, capture_session, stop_reason, sequence, s_tx_retries,
+                             stop_rc, diagnostic_flags(), capture_epoch, s_connection_epoch,
+                             tx_now_ms(NULL) - capture_ms);
+            diagnostic_stats(capture_session, sequence, max_read_us, max_tx_ms, max_gap_ms);
+            end_logged = true;
             ESP_LOGI(TAG, "Capture stop session=%lu queued_frames=%lu retries=%lu control_rc=%d",
                      (unsigned long)capture_session, (unsigned long)sequence,
                      (unsigned long)s_tx_retries, stop_rc);
             if (capture_session != s_session || capture_epoch != s_connection_epoch) continue;
             if (stop_rc != 0) {
-                send_error(capture_session, "transport");
                 ui_status_set_state(UI_STATUS_ERROR, "BLE send failed");
             }
-            s_recording = false; s_stop_requested = false; sequence = 0;
+            sequence = 0;
         }
     }
 }
@@ -458,6 +702,8 @@ static void button_cb(bsp_btn_t button, bsp_btn_ev_t event, void *user)
     button_action_t action = button_gesture_update(gesture, edge, now_ms,
                                                    context, BUTTON_LONG_PRESS_MS);
     const uint32_t duration_ms = now_ms - gesture->started_ms;
+    device_diag_emit(DD_BUTTON, s_session, button, edge, action, duration_ms,
+                     diagnostic_flags(), context, gesture->context, s_stop_reason);
     if (button == BSP_BTN_OK && event == BSP_BTN_PRESS) {
         // The driver's double-click state does not time a held second press.
         // An independent one-shot keeps OK long-press valid after quick taps.
@@ -481,14 +727,27 @@ static void button_cb(bsp_btn_t button, bsp_btn_ev_t event, void *user)
         if (s_conn == NO_CONN || !s_host_ready || action != BUTTON_ACTION_CLICK) return;
         // One toggle per short release, without the double-click wait.
         if (!s_recording) {
+            if (s_finishing || s_result_pending) {
+                device_diag_emit(DD_START_BLOCKED, s_session, diagnostic_flags(),
+                                 s_connection_epoch, s_queued_frames, duration_ms, 0, 0, 0, 0);
+                ui_status_set_state(UI_STATUS_PROCESSING, "Wait for result");
+                return;
+            }
             s_session = esp_random();
             if (s_session == 0) s_session = 1;
             s_control_seq = 0;
+            s_queued_frames = 0;
             s_stop_requested = false;
+            s_stop_reason = DD_REASON_NONE;
+            device_diag_emit(DD_START_REQUEST, s_session, s_connection_epoch, duration_ms,
+                             diagnostic_flags(), 0, 0, 0, 0, 0);
             s_recording = true;
             ui_status_set_state(UI_STATUS_RECORDING, "Listening");
             if (s_audio_task) xTaskNotifyGive(s_audio_task);
         } else {
+            s_stop_reason = DD_REASON_UP;
+            device_diag_emit(DD_STOP_REQUEST, s_session, s_stop_reason, s_queued_frames,
+                             diagnostic_flags(), s_connection_epoch, duration_ms, 0, 0, 0);
             s_stop_requested = true;
             ui_status_set_state(UI_STATUS_PROCESSING, "Processing");
         }
@@ -507,6 +766,9 @@ static void button_cb(bsp_btn_t button, bsp_btn_ev_t event, void *user)
             // an ESC/cancel gesture. The Worker owns the full cloud/paste
             // cancellation window; this flag only releases the microphone.
             if (s_recording) {
+                s_stop_reason = DD_REASON_OK_LONG;
+                device_diag_emit(DD_STOP_REQUEST, s_session, s_stop_reason, s_queued_frames,
+                                 diagnostic_flags(), s_connection_epoch, duration_ms, 0, 0, 0);
                 s_stop_requested = true;
                 send_button_event(button, "long", duration_ms);
                 ui_status_set_state(UI_STATUS_PROCESSING, "Cancelling");
@@ -516,6 +778,9 @@ static void button_cb(bsp_btn_t button, bsp_btn_ev_t event, void *user)
             }
         } else if (action == BUTTON_ACTION_CLICK) {
             if (s_recording) {
+                s_stop_reason = DD_REASON_OK_CLICK;
+                device_diag_emit(DD_STOP_REQUEST, s_session, s_stop_reason, s_queued_frames,
+                                 diagnostic_flags(), s_connection_epoch, duration_ms, 0, 0, 0);
                 s_stop_requested = true;
                 send_button_event(button, "click", duration_ms);
                 ui_status_set_state(UI_STATUS_PROCESSING, "Cancelling");
@@ -537,19 +802,29 @@ static int access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *
     }
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR || kind != 1) return BLE_ATT_ERR_READ_NOT_PERMITTED;
     char value[MAX_CONTROL + 1] = {0}; uint16_t len = 0;
-    if (ble_hs_mbuf_to_flat(ctxt->om, value, MAX_CONTROL, &len) != 0 || len == 0 || len > MAX_CONTROL) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    if (ble_hs_mbuf_to_flat(ctxt->om, value, MAX_CONTROL, &len) != 0 || len == 0 || len > MAX_CONTROL) {
+        device_diag_emit(DD_HOST_REJECT, s_session, 1, conn, len, diagnostic_flags(), s_connection_epoch, 0, 0, 0);
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
     cJSON *root = cJSON_ParseWithLength(value, len);
-    if (!root || !cJSON_IsObject(root) || !cJSON_IsNumber(cJSON_GetObjectItem(root, "v")) || cJSON_GetObjectItem(root, "v")->valueint != 1) { cJSON_Delete(root); return BLE_ATT_ERR_UNLIKELY;
+    if (!root || !cJSON_IsObject(root) || !cJSON_IsNumber(cJSON_GetObjectItem(root, "v")) || cJSON_GetObjectItem(root, "v")->valueint != 1) {
+        device_diag_emit(DD_HOST_REJECT, s_session, 2, conn, len, diagnostic_flags(), s_connection_epoch, 0, 0, 0);
+        cJSON_Delete(root); return BLE_ATT_ERR_UNLIKELY;
     }
     const cJSON *type = cJSON_GetObjectItem(root, "type");
     if (cJSON_IsString(type) && strcmp(type->valuestring, "host_ready") == 0) {
         if (conn != s_conn || !s_control_subscribed || !s_audio_subscribed || ble_att_mtu(conn) < 185) {
+            device_diag_emit(DD_HOST_REJECT, s_session, 4, conn, ble_att_mtu(conn),
+                             diagnostic_flags(), s_connection_epoch, 0, 0, 0);
             ESP_LOGW(TAG, "Host ready rejected conn=%u control=%u audio=%u mtu=%u",
                      conn, s_control_subscribed, s_audio_subscribed, ble_att_mtu(conn));
             cJSON_Delete(root);
             return BLE_ATT_ERR_UNLIKELY;
         }
         s_host_ready = true;
+        s_result_pending = false;
+        device_diag_emit(DD_HOST_READY, s_session, conn, ble_att_mtu(conn), diagnostic_flags(),
+                         s_connection_epoch, 0, 0, 0, 0);
         ESP_LOGI(TAG, "Host ready epoch=%lu", (unsigned long)s_connection_epoch);
         log_link("Host link");
         request_audio_link();
@@ -557,16 +832,32 @@ static int access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *
     } else if (cJSON_IsString(type) && strcmp(type->valuestring, "host_state") == 0) {
         const cJSON *state = cJSON_GetObjectItem(root, "state");
         if (cJSON_IsString(state)) {
+            const uint32_t state_id = !strcmp(state->valuestring, "ready") ? 1 :
+                !strcmp(state->valuestring, "recording") ? 2 :
+                !strcmp(state->valuestring, "processing") ? 3 :
+                !strcmp(state->valuestring, "success") ? 4 :
+                !strcmp(state->valuestring, "error") ? 5 : 0;
+            uint32_t length, category;
+            const uint32_t hash = diagnostic_message(cJSON_GetObjectItem(root, "message"), &length, &category);
+            device_diag_emit(DD_HOST_STATE, s_session, state_id, diagnostic_flags(), s_queued_frames,
+                             s_connection_epoch, category, hash, length, s_stop_reason);
             if (strcmp(state->valuestring, "ready") == 0) {
                 s_host_ready = true;
-                ui_status_set_state(UI_STATUS_READY, "Ready");
+                if (!s_recording) s_result_pending = false;
+                if (!s_recording && !s_finishing) ui_status_set_state(UI_STATUS_READY, "Ready");
             } else if (strcmp(state->valuestring, "recording") == 0) {
                 ui_status_set_state(UI_STATUS_RECORDING, "Listening");
             } else if (strcmp(state->valuestring, "processing") == 0) {
+                s_result_pending = true;
                 ui_status_set_state(UI_STATUS_PROCESSING, "Processing");
             } else if (strcmp(state->valuestring, "success") == 0) {
-                ui_status_set_state(UI_STATUS_SUCCESS, "Sent");
+                if (!s_recording) {
+                    s_result_pending = false;
+                    ui_status_set_state(UI_STATUS_SUCCESS, "Sent");
+                }
             } else if (strcmp(state->valuestring, "error") == 0) {
+                s_result_pending = false;
+                s_stop_reason = DD_REASON_HOST_ERROR;
                 ESP_LOGW(TAG, "Host reported error session=%lu recording=%u; cancelling capture",
                          (unsigned long)s_session, s_recording);
                 s_recording = false;
@@ -617,17 +908,25 @@ static void on_sync(void)
         (void)advertise();
     }
 }
-static void on_reset(int reason) { ESP_LOGE(TAG, "NimBLE reset %d", reason); }
+static void on_reset(int reason)
+{
+    device_diag_emit(DD_NIMBLE_RESET, s_session, reason, diagnostic_flags(), s_connection_epoch, 0, 0, 0, 0, 0);
+    ESP_LOGE(TAG, "NimBLE reset %d", reason);
+}
 static void host_task(void *arg) { (void)arg; nimble_port_run(); nimble_port_freertos_deinit(); }
 
 static int gap_event(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
     if (event->type == BLE_GAP_EVENT_CONNECT) {
+        device_diag_emit(DD_CONNECT, s_session, event->connect.status,
+                         event->connect.status == 0 ? event->connect.conn_handle : NO_CONN,
+                         s_connection_epoch, diagnostic_flags(), 0, 0, 0, 0);
         if (event->connect.status == 0) {
             ++s_connection_epoch;
             s_conn = event->connect.conn_handle;
             s_host_ready = false; s_control_subscribed = false; s_audio_subscribed = false;
+            s_result_pending = false; s_finishing = false;
             s_hello_sent = false; s_link_parameters_requested = false;
             log_link("Connected");
             ui_status_set_state(UI_STATUS_STARTING, "Connecting");
@@ -637,10 +936,14 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             advertise();
         }
     } else if (event->type == BLE_GAP_EVENT_DISCONNECT) {
+        device_diag_emit(DD_DISCONNECT, s_session, event->disconnect.reason, diagnostic_flags(),
+                         s_connection_epoch, s_queued_frames, 0, 0, 0, 0);
+        s_stop_reason = DD_REASON_DISCONNECT;
         ESP_LOGW(TAG, "Disconnected reason=%d session=%lu recording=%u", event->disconnect.reason,
                  (unsigned long)s_session, s_recording);
         ++s_connection_epoch;
         s_recording = false; s_stop_requested = false; s_host_ready = false;
+        s_result_pending = false; s_finishing = false;
         s_control_subscribed = false; s_audio_subscribed = false; s_conn = NO_CONN;
         s_hello_sent = false; s_link_parameters_requested = false;
         ui_status_set_state(UI_STATUS_DISCONNECTED, "Waiting for Vokie");
@@ -653,6 +956,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (event->subscribe.attr_handle == s_audio_handle) {
             s_audio_subscribed = event->subscribe.cur_notify;
         }
+        device_diag_emit(DD_SUBSCRIBE, s_session, event->subscribe.attr_handle,
+                         event->subscribe.cur_notify, diagnostic_flags(), s_connection_epoch, 0, 0, 0, 0);
         ESP_LOGI(TAG, "Subscribe handle=%u notify=%u control=%u audio=%u", event->subscribe.attr_handle,
                  event->subscribe.cur_notify, s_control_subscribed, s_audio_subscribed);
         if (!s_control_subscribed || !s_audio_subscribed) {
@@ -663,11 +968,18 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             s_hello_sent = notify_control(hello) == 0;
         }
     } else if (event->type == BLE_GAP_EVENT_MTU) {
+        device_diag_emit(DD_MTU, s_session, event->mtu.conn_handle, event->mtu.value,
+                         s_connection_epoch, 0, 0, 0, 0, 0);
         ESP_LOGI(TAG, "MTU updated conn=%u mtu=%u", event->mtu.conn_handle, event->mtu.value);
     } else if (event->type == BLE_GAP_EVENT_CONN_UPDATE) {
+        device_diag_emit(DD_LINK_REQUEST, s_session, 3, event->conn_update.status,
+                         s_conn, s_connection_epoch, 0, 0, 0, 0);
         ESP_LOGI(TAG, "Connection parameter update status=%d", event->conn_update.status);
         log_link("Updated link");
     } else if (event->type == BLE_GAP_EVENT_DATA_LEN_CHG) {
+        device_diag_emit(DD_DATA_LENGTH, s_session, event->data_len_chg.conn_handle,
+                         event->data_len_chg.max_tx_octets, event->data_len_chg.max_rx_octets,
+                         s_connection_epoch, 0, 0, 0, 0);
         ESP_LOGI(TAG, "Data length updated conn=%u tx_octets=%u rx_octets=%u",
                  event->data_len_chg.conn_handle, event->data_len_chg.max_tx_octets,
                  event->data_len_chg.max_rx_octets);
@@ -686,7 +998,7 @@ esp_err_t vokie_ble_start(void)
     // Per-frame NimBLE INFO traffic hides failures and adds console work to the
     // audio path. Keep our bounded session/connection diagnostics instead.
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
-    ESP_LOGI(TAG, "BLE audio transport: bounded TX retries and link tuning");
+    ESP_LOGI(TAG, "BLE audio transport: cancel on failure, result gate, audio-time RAM logging");
     esp_err_t err = bsp_audio_init();
     if (err != ESP_OK) return err;
     // The worker owns stream open/close as well as all PCM I/O.
@@ -703,7 +1015,7 @@ esp_err_t vokie_ble_start(void)
     if (ble_gatts_count_cfg(services) != 0 || ble_gatts_add_svcs(services) != 0) return ESP_FAIL;
     ble_hs_cfg.reset_cb = on_reset; ble_hs_cfg.sync_cb = on_sync;
     nimble_port_freertos_init(host_task);
-    if (xTaskCreate(audio_task, "vokie_audio", 4096, NULL, 5, &s_audio_task) != pdPASS) return ESP_ERR_NO_MEM;
+    if (xTaskCreate(audio_task, "vokie_audio", 5120, NULL, 5, &s_audio_task) != pdPASS) return ESP_ERR_NO_MEM;
     s_started = true; ESP_LOGI(TAG, "Vokie Passport BLE ready"); return ESP_OK;
 }
 

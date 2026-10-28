@@ -103,6 +103,7 @@ LICENSE                  仓库许可证
 本仓库文档按功能域组织。`authoritative` 指对开发与协作有约束力的文档；`参考` 指提供背景或索引的文档。
 
 - [`docs/ai-passport-ble-protocol.zh_CN.md`](ai-passport-ble-protocol.zh_CN.md) — 公开的 BLE V1 服务、消息、音频分片、生命周期与安全边界。
+- [`docs/device-diagnostics.zh_CN.md`](device-diagnostics.zh_CN.md) — 设备数值事件持久化、有界存储、USB 导出与解码。
 - [`docs/THIRD_PARTY_NOTICES.zh_CN.md`](THIRD_PARTY_NOTICES.zh_CN.md) — 依赖版本、许可证与再分发说明。
 - [`docs/development/`](development/README.zh_CN.md) — 工程规则与可复用工作流：`ai-guide.md`、`engineering/`、`ci/`、`release/` 区。其 README 列明它们。
 - [`docs/contribution/`](contribution/README.zh_CN.md) — 协作、文档与提交/PR 约定。
