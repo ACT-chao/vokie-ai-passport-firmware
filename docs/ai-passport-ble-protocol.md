@@ -141,6 +141,20 @@ The Vokie plugin bounds a session to 15,000 audio frames (five minutes), waits
 a stall, and waits at most 500 ms for announced tail frames after `ptt_up`.
 These are host implementation limits, not additional BLE fields.
 
+The peripheral requests a 15-30 ms connection interval with zero peripheral
+latency and a 251-byte link-layer transmit data length. The central may choose
+different values; neither request changes the V1 wire format or minimum ATT MTU.
+Temporary local enqueue failures (`ENOMEM`, `EAGAIN`, `EBUSY`) retry the same audio
+fragment for at most 80 ms, only on the audio worker. PTT start/end notifications
+have a 200 ms retry bound. Accepted notifications are never resent by this
+policy, and audio sequence numbers advance only after every fragment is queued.
+A disconnect, unsubscribe, or session replacement invalidates pending retries.
+Serial diagnostics record connection interval, MTU, subscription changes,
+session frame/retry counters, and exact enqueue errors; they do not contain PCM
+or transcripts. A successful local enqueue does not confirm host delivery.
+An explicit `host_state:error` cancels device capture so a stalled host request
+cannot leave the microphone worker streaming into an abandoned session.
+
 ## Security and device selection
 
 Protocol V1 provides no BLE pairing, peer authentication, or application-layer

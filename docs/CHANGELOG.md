@@ -6,6 +6,8 @@
 
 ## Unreleased
 
+- Retry temporarily rejected BLE audio notifications for at most 80 ms without duplicating accepted frames, and send PTT lifecycle notifications from the audio worker with a 200 ms bound. Count audio sequences only after successful enqueue, cancel stale retries after reconnection/session changes, request 15-30 ms connection intervals and longer link-layer packets, and log negotiated link parameters and precise transport failures. An explicit host error stops abandoned microphone capture. Windows throughput and end-to-end voice acceptance remain device checks.
+
 - Explicitly mute and power down the speaker DAC before pausing its clocks, while keeping microphone bias/filter state. A zero playback volume now disables the output; only deliberate playback can re-enable it with a running stream. Verify output registers and keep the stream awake for retry if the transition fails. This addresses an unsafe idle-output path identified while investigating intermittent post-flash noise; acoustic reproduction remains a device check.
 
 - Execute short button actions on debounced release instead of waiting for double-click classification. Consecutive taps remain separate actions; OK keeps its 650 ms long-press clear/cancel behavior even after a quick tap, without deleting again on release.
