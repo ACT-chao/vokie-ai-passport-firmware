@@ -62,6 +62,10 @@ run_static_checks() {
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_button_gesture.c -o "${test_dir}/test_button_gesture"
     "${test_dir}/test_button_gesture"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_ble_tx_retry.c main/ble_tx_retry.c \
+        -o "${test_dir}/test_ble_tx_retry"
+    "${test_dir}/test_ble_tx_retry"
     python3 tests/test_verify_firmware.py
     rm -rf "${test_dir}"
     echo "Host tests: PASS"

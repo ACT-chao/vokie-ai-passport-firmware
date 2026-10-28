@@ -5,10 +5,12 @@
 #include "ui_status.h"
 #include "bsp_button.h"
 #include "button_gesture.h"
+#include "ble_tx_retry.h"
 #include "esp_timer.h"
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "host/ble_att.h"
@@ -35,6 +37,9 @@ static const uint16_t NO_CONN = BLE_HS_CONN_HANDLE_NONE;
 #define ADPCM_BYTES 166
 #define MAX_CONTROL 182
 #define EMPTY_FINAL_SEQUENCE 0xffffffffUL
+#define AUDIO_TX_TIMEOUT_MS 80
+#define CONTROL_TX_TIMEOUT_MS 200
+#define TX_RETRY_INTERVAL_MS 5
 #define SERVICE_BYTES 0x00,0x45,0x49,0x4b,0x4f,0x56,0x1a,0x9d,0x6f,0x4b,0x7b,0x6a,0x01,0x00,0x0e,0x7f
 #define CONTROL_BYTES 0x00,0x45,0x49,0x4b,0x4f,0x56,0x1a,0x9d,0x6f,0x4b,0x7b,0x6a,0x02,0x00,0x0e,0x7f
 #define AUDIO_BYTES 0x00,0x45,0x49,0x4b,0x4f,0x56,0x1a,0x9d,0x6f,0x4b,0x7b,0x6a,0x03,0x00,0x0e,0x7f
@@ -62,6 +67,9 @@ static bool s_started;
 static button_gesture_t s_button_gestures[3];
 static esp_timer_handle_t s_ok_hold_timer;
 static volatile uint32_t s_connection_epoch = 1;
+static bool s_hello_sent;
+static bool s_link_parameters_requested;
+static uint32_t s_tx_retries;
 #define BUTTON_LONG_PRESS_MS CONFIG_BUTTON_LONG_PRESS_TIME_MS
 
 static bool host_is_ready(void)
@@ -105,7 +113,8 @@ static int access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *
 static int gap_event(struct ble_gap_event *event, void *arg);
 static int notify_bytes(uint16_t handle, const uint8_t *data, size_t len)
 {
-    if (s_conn == NO_CONN || len > ble_att_mtu(s_conn) - 3) return BLE_HS_EMSGSIZE;
+    if (s_conn == NO_CONN) return BLE_HS_ENOTCONN;
+    if (len > ble_att_mtu(s_conn) - 3) return BLE_HS_EMSGSIZE;
     struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
     if (!om) return BLE_HS_ENOMEM;
     return ble_gatts_notify_custom(s_conn, handle, om);
@@ -115,7 +124,109 @@ static int notify_control(const char *json)
 {
     size_t len = strlen(json);
     if (len == 0 || len > MAX_CONTROL) return BLE_HS_EMSGSIZE;
-    return notify_bytes(s_control_handle, (const uint8_t *)json, len);
+    int rc = notify_bytes(s_control_handle, (const uint8_t *)json, len);
+    if (rc != 0) ESP_LOGW(TAG, "Control enqueue failed rc=%d mtu=%u", rc, ble_att_mtu(s_conn));
+    return rc;
+}
+
+typedef struct {
+    uint16_t conn;
+    uint16_t handle;
+    uint32_t epoch;
+    uint32_t session;
+    const uint8_t *data;
+    size_t len;
+    bool require_recording;
+} tx_context_t;
+
+static bool tx_valid(void *arg)
+{
+    const tx_context_t *tx = arg;
+    return tx->conn != NO_CONN && tx->conn == s_conn &&
+           tx->epoch == s_connection_epoch && tx->session == s_session &&
+           (!tx->require_recording || s_recording) &&
+           (tx->handle == s_audio_handle ? s_audio_subscribed : s_control_subscribed);
+}
+
+static int tx_once(void *arg)
+{
+    const tx_context_t *tx = arg;
+    if (!tx_valid(arg)) return BLE_HS_ENOTCONN;
+    if (tx->len > ble_att_mtu(tx->conn) - 3) return BLE_HS_EMSGSIZE;
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(tx->data, tx->len);
+    if (!om) return BLE_HS_ENOMEM;
+    // NimBLE consumes om on both success and failure. Allocate anew per attempt.
+    return ble_gatts_notify_custom(tx->conn, tx->handle, om);
+}
+
+static bool tx_retryable(int rc)
+{
+    return rc == BLE_HS_ENOMEM || rc == BLE_HS_EAGAIN || rc == BLE_HS_EBUSY;
+}
+
+static uint32_t tx_now_ms(void *arg)
+{
+    (void)arg;
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+static void tx_wait_ms(void *arg, uint32_t delay_ms)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(delay_ms) ? pdMS_TO_TICKS(delay_ms) : 1);
+}
+
+static int notify_worker(uint16_t handle, const uint8_t *data, size_t len,
+                         uint32_t session, uint32_t epoch, bool require_recording,
+                         uint32_t timeout_ms)
+{
+    tx_context_t tx = {s_conn, handle, epoch, session, data, len, require_recording};
+    const ble_tx_retry_ops_t ops = {&tx, tx_valid, tx_once, tx_retryable, tx_now_ms, tx_wait_ms};
+    const ble_tx_retry_result_t result = ble_tx_retry_send(&ops, timeout_ms, TX_RETRY_INTERVAL_MS);
+    if (result.attempts > 1) s_tx_retries += result.attempts - 1;
+    if (result.cancelled) return BLE_HS_ENOTCONN;
+    if (result.code != 0) {
+        ESP_LOGE(TAG, "TX failed session=%lu handle=%u rc=%d attempts=%lu wait_ms=%lu mtu=%u heap=%lu",
+                 (unsigned long)session, handle, result.code, (unsigned long)result.attempts,
+                 (unsigned long)result.elapsed_ms, ble_att_mtu(tx.conn),
+                 (unsigned long)esp_get_free_heap_size());
+    }
+    return result.code;
+}
+
+static int notify_control_worker(const char *json, uint32_t session, uint32_t epoch,
+                                bool require_recording)
+{
+    const size_t len = strlen(json);
+    if (!len || len > MAX_CONTROL) return BLE_HS_EMSGSIZE;
+    return notify_worker(s_control_handle, (const uint8_t *)json, len, session, epoch,
+                         require_recording, CONTROL_TX_TIMEOUT_MS);
+}
+
+static void log_link(const char *event)
+{
+    struct ble_gap_conn_desc desc;
+    if (s_conn != NO_CONN && ble_gap_conn_find(s_conn, &desc) == 0) {
+        ESP_LOGI(TAG, "%s conn=%u mtu=%u interval_us=%lu latency=%u supervision_ms=%lu",
+                 event, s_conn, ble_att_mtu(s_conn), (unsigned long)desc.conn_itvl * 1250,
+                 desc.conn_latency, (unsigned long)desc.supervision_timeout * 10);
+    }
+}
+
+static void request_audio_link(void)
+{
+    if (s_link_parameters_requested || s_conn == NO_CONN) return;
+    s_link_parameters_requested = true;
+    const struct ble_gap_upd_params params = {
+        .itvl_min = 12, .itvl_max = 24, .latency = 0,
+        .supervision_timeout = 400, .min_ce_len = 0, .max_ce_len = 0,
+    };
+    // Request 15-30 ms connection events for 20 ms voice frames. The central
+    // retains final control; a refusal is diagnostic, never a handshake failure.
+    int rc = ble_gap_update_params(s_conn, &params);
+    ESP_LOGI(TAG, "Audio link parameter request rc=%d target_interval_us=15000..30000", rc);
+    rc = ble_gap_set_data_len(s_conn, 251, 2120);
+    ESP_LOGI(TAG, "Audio link data length request rc=%d tx_octets=251", rc);
 }
 
 static void send_error(uint32_t session, const char *message)
@@ -159,8 +270,10 @@ static size_t encode_adpcm(const int16_t *pcm, uint8_t out[ADPCM_BYTES])
     return ADPCM_BYTES;
 }
 
-static int notify_audio(uint32_t session, uint32_t sequence, const uint8_t *payload, size_t len)
+static int notify_audio(uint32_t session, uint32_t epoch, uint32_t sequence,
+                        const uint8_t *payload, size_t len)
 {
+    if (s_conn == NO_CONN || epoch != s_connection_epoch || session != s_session) return BLE_HS_ENOTCONN;
     const size_t mtu_payload = ble_att_mtu(s_conn) - 3;
     if (mtu_payload <= 16) return BLE_HS_EMSGSIZE;
     const size_t chunk = mtu_payload - 16;
@@ -174,7 +287,8 @@ static int notify_audio(uint32_t session, uint32_t sequence, const uint8_t *payl
         memcpy(packet + 4, &session, 4); memcpy(packet + 8, &sequence, 4);
         packet[12] = part; packet[13] = count; packet[14] = amount & 0xff; packet[15] = amount >> 8;
         memcpy(packet + 16, payload + offset, amount);
-        int rc = notify_bytes(s_audio_handle, packet, 16 + amount);
+        int rc = notify_worker(s_audio_handle, packet, 16 + amount, session, epoch,
+                               true, AUDIO_TX_TIMEOUT_MS);
         if (rc != 0) return rc;
     }
     return 0;
@@ -204,6 +318,8 @@ static void audio_task(void *arg)
     uint8_t encoded[ADPCM_BYTES];
     uint32_t sequence = 0;
     uint32_t capture_session = 0;
+    uint32_t capture_epoch = 0;
+    uint32_t stats_ms = 0;
     bool capturing = false;
     for (;;) {
         if (!s_recording) {
@@ -223,13 +339,33 @@ static void audio_task(void *arg)
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
         }
-        if (!capturing || capture_session != s_session) {
+        if (!capturing || capture_session != s_session || capture_epoch != s_connection_epoch) {
             capture_session = s_session;
+            capture_epoch = s_connection_epoch;
             sequence = 0;
+            s_tx_retries = 0;
+            char start_json[MAX_CONTROL + 1];
+            snprintf(start_json, sizeof(start_json),
+                     "{\"v\":1,\"type\":\"ptt_down\",\"sessionId\":%lu,\"seq\":0}",
+                     (unsigned long)capture_session);
+            // Retry in the audio worker; button and NimBLE callbacks never wait.
+            int start_rc = notify_control_worker(start_json, capture_session, capture_epoch, true);
+            if (start_rc != 0) {
+                if (s_recording && capture_session == s_session && capture_epoch == s_connection_epoch) {
+                    s_recording = false;
+                    s_stop_requested = false;
+                    ui_status_set_state(UI_STATUS_ERROR, "BLE send failed");
+                }
+                continue;
+            }
+            stats_ms = tx_now_ms(NULL);
+            ESP_LOGI(TAG, "Capture start session=%lu epoch=%lu", (unsigned long)capture_session,
+                     (unsigned long)capture_epoch);
+            log_link("Capture link");
             // Pause also resets DMA between sessions; a failure returns to
             // idle so the next press can retry instead of rebooting.
             if (bsp_audio_pause() != ESP_OK) {
-                if (s_recording && capture_session == s_session) {
+                if (s_recording && capture_session == s_session && capture_epoch == s_connection_epoch) {
                     s_recording = false;
                     s_stop_requested = false;
                     send_error(capture_session, "audio_pause");
@@ -238,7 +374,7 @@ static void audio_task(void *arg)
                 continue;
             }
             if (bsp_audio_set_format(16000, 16, 1) != ESP_OK) {
-                if (s_recording && capture_session == s_session) {
+                if (s_recording && capture_session == s_session && capture_epoch == s_connection_epoch) {
                     s_recording = false;
                     s_stop_requested = false;
                     send_error(capture_session, "audio_open");
@@ -248,9 +384,9 @@ static void audio_task(void *arg)
             }
             capturing = true;
         }
-        if (!s_recording || capture_session != s_session) continue;
+        if (!s_recording || capture_session != s_session || capture_epoch != s_connection_epoch) continue;
         if (bsp_audio_read(pcm, sizeof(pcm)) != ESP_OK) {
-            if (s_recording && capture_session == s_session) {
+            if (s_recording && capture_session == s_session && capture_epoch == s_connection_epoch) {
                 s_stop_requested = false;
                 send_error(capture_session, "audio_read");
                 s_recording = false;
@@ -259,7 +395,7 @@ static void audio_task(void *arg)
             continue;
         }
         // A disconnect or a new session during blocking I/O invalidates PCM.
-        if (!s_recording || capture_session != s_session) continue;
+        if (!s_recording || capture_session != s_session || capture_epoch != s_connection_epoch) continue;
         if (!s_audio_subscribed || ble_att_mtu(s_conn) < 185) {
             s_stop_requested = false; send_error(s_session, "mtu");
             s_recording = false;
@@ -267,18 +403,39 @@ static void audio_task(void *arg)
             continue;
         }
         size_t encoded_len = encode_adpcm(pcm, encoded);
-        if (notify_audio(s_session, sequence++, encoded, encoded_len) != 0) {
+        int tx_rc = notify_audio(capture_session, capture_epoch, sequence, encoded, encoded_len);
+        // A reconnect/new request invalidates this worker's old frame and state.
+        if (capture_session != s_session || capture_epoch != s_connection_epoch || !s_recording) continue;
+        if (tx_rc != 0) {
             s_stop_requested = true;
-            send_error(s_session, "transport");
+            ESP_LOGE(TAG, "Capture transport failure session=%lu next_sequence=%lu rc=%d retries=%lu",
+                     (unsigned long)capture_session, (unsigned long)sequence, tx_rc,
+                     (unsigned long)s_tx_retries);
+            send_error(capture_session, "transport");
             s_recording = false;
             ui_status_set_state(UI_STATUS_ERROR, "BLE send failed");
+        } else {
+            ++sequence;
+        }
+        if (tx_now_ms(NULL) - stats_ms >= 1000) {
+            ESP_LOGI(TAG, "Capture stats session=%lu queued_frames=%lu retries=%lu",
+                     (unsigned long)capture_session, (unsigned long)sequence, (unsigned long)s_tx_retries);
+            stats_ms = tx_now_ms(NULL);
         }
         if (s_stop_requested) {
             char json[MAX_CONTROL + 1];
             snprintf(json, sizeof(json), "{\"v\":1,\"type\":\"ptt_up\",\"sessionId\":%lu,\"seq\":%lu,\"finalSequence\":%lu}",
-                     (unsigned long)s_session, (unsigned long)++s_control_seq,
+                     (unsigned long)capture_session, (unsigned long)++s_control_seq,
                      sequence ? (unsigned long)(sequence - 1) : EMPTY_FINAL_SEQUENCE);
-            (void)notify_control(json);
+            int stop_rc = notify_control_worker(json, capture_session, capture_epoch, false);
+            ESP_LOGI(TAG, "Capture stop session=%lu queued_frames=%lu retries=%lu control_rc=%d",
+                     (unsigned long)capture_session, (unsigned long)sequence,
+                     (unsigned long)s_tx_retries, stop_rc);
+            if (capture_session != s_session || capture_epoch != s_connection_epoch) continue;
+            if (stop_rc != 0) {
+                send_error(capture_session, "transport");
+                ui_status_set_state(UI_STATUS_ERROR, "BLE send failed");
+            }
             s_recording = false; s_stop_requested = false; sequence = 0;
         }
     }
@@ -328,17 +485,9 @@ static void button_cb(bsp_btn_t button, bsp_btn_ev_t event, void *user)
             if (s_session == 0) s_session = 1;
             s_control_seq = 0;
             s_stop_requested = false;
-            char json[MAX_CONTROL + 1];
-            snprintf(json, sizeof(json), "{\"v\":1,\"type\":\"ptt_down\",\"sessionId\":%lu,\"seq\":0}",
-                     (unsigned long)s_session);
-            if (notify_control(json) != 0) {
-                s_recording = false;
-                ui_status_set_state(UI_STATUS_ERROR, "BLE send failed");
-            } else if (host_is_ready()) {
-                s_recording = true;
-                ui_status_set_state(UI_STATUS_RECORDING, "Listening");
-                if (s_audio_task) xTaskNotifyGive(s_audio_task);
-            }
+            s_recording = true;
+            ui_status_set_state(UI_STATUS_RECORDING, "Listening");
+            if (s_audio_task) xTaskNotifyGive(s_audio_task);
         } else {
             s_stop_requested = true;
             ui_status_set_state(UI_STATUS_PROCESSING, "Processing");
@@ -394,7 +543,16 @@ static int access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *
     }
     const cJSON *type = cJSON_GetObjectItem(root, "type");
     if (cJSON_IsString(type) && strcmp(type->valuestring, "host_ready") == 0) {
+        if (conn != s_conn || !s_control_subscribed || !s_audio_subscribed || ble_att_mtu(conn) < 185) {
+            ESP_LOGW(TAG, "Host ready rejected conn=%u control=%u audio=%u mtu=%u",
+                     conn, s_control_subscribed, s_audio_subscribed, ble_att_mtu(conn));
+            cJSON_Delete(root);
+            return BLE_ATT_ERR_UNLIKELY;
+        }
         s_host_ready = true;
+        ESP_LOGI(TAG, "Host ready epoch=%lu", (unsigned long)s_connection_epoch);
+        log_link("Host link");
+        request_audio_link();
         ui_status_set_state(UI_STATUS_READY, "Ready");
     } else if (cJSON_IsString(type) && strcmp(type->valuestring, "host_state") == 0) {
         const cJSON *state = cJSON_GetObjectItem(root, "state");
@@ -409,6 +567,10 @@ static int access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *
             } else if (strcmp(state->valuestring, "success") == 0) {
                 ui_status_set_state(UI_STATUS_SUCCESS, "Sent");
             } else if (strcmp(state->valuestring, "error") == 0) {
+                ESP_LOGW(TAG, "Host reported error session=%lu recording=%u; cancelling capture",
+                         (unsigned long)s_session, s_recording);
+                s_recording = false;
+                s_stop_requested = false;
                 ui_status_set_state(UI_STATUS_ERROR, "Try again");
             }
         }
@@ -466,15 +628,21 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             ++s_connection_epoch;
             s_conn = event->connect.conn_handle;
             s_host_ready = false; s_control_subscribed = false; s_audio_subscribed = false;
+            s_hello_sent = false; s_link_parameters_requested = false;
+            log_link("Connected");
             ui_status_set_state(UI_STATUS_STARTING, "Connecting");
         } else {
+            ESP_LOGW(TAG, "Connection failed status=%d", event->connect.status);
             ui_status_set_state(UI_STATUS_DISCONNECTED, "Waiting for Vokie");
             advertise();
         }
     } else if (event->type == BLE_GAP_EVENT_DISCONNECT) {
+        ESP_LOGW(TAG, "Disconnected reason=%d session=%lu recording=%u", event->disconnect.reason,
+                 (unsigned long)s_session, s_recording);
         ++s_connection_epoch;
         s_recording = false; s_stop_requested = false; s_host_ready = false;
         s_control_subscribed = false; s_audio_subscribed = false; s_conn = NO_CONN;
+        s_hello_sent = false; s_link_parameters_requested = false;
         ui_status_set_state(UI_STATUS_DISCONNECTED, "Waiting for Vokie");
         advertise();
     } else if (event->type == BLE_GAP_EVENT_SUBSCRIBE && event->subscribe.conn_handle == s_conn) {
@@ -485,13 +653,29 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (event->subscribe.attr_handle == s_audio_handle) {
             s_audio_subscribed = event->subscribe.cur_notify;
         }
-        static bool hello_sent;
+        ESP_LOGI(TAG, "Subscribe handle=%u notify=%u control=%u audio=%u", event->subscribe.attr_handle,
+                 event->subscribe.cur_notify, s_control_subscribed, s_audio_subscribed);
         if (!s_control_subscribed || !s_audio_subscribed) {
-            hello_sent = false;
-        } else if (!hello_sent) {
+            s_hello_sent = false;
+            if (s_recording) ESP_LOGW(TAG, "Subscription removed during capture session=%lu", (unsigned long)s_session);
+        } else if (!s_hello_sent) {
             const char hello[] = "{\"v\":1,\"type\":\"hello\",\"device\":\"ai-passport\",\"fw\":\"0.1.0\",\"codec\":\"ima-adpcm\",\"sampleRate\":16000,\"channels\":1,\"frameMs\":20}";
-            hello_sent = notify_control(hello) == 0;
+            s_hello_sent = notify_control(hello) == 0;
         }
+    } else if (event->type == BLE_GAP_EVENT_MTU) {
+        ESP_LOGI(TAG, "MTU updated conn=%u mtu=%u", event->mtu.conn_handle, event->mtu.value);
+    } else if (event->type == BLE_GAP_EVENT_CONN_UPDATE) {
+        ESP_LOGI(TAG, "Connection parameter update status=%d", event->conn_update.status);
+        log_link("Updated link");
+    } else if (event->type == BLE_GAP_EVENT_DATA_LEN_CHG) {
+        ESP_LOGI(TAG, "Data length updated conn=%u tx_octets=%u rx_octets=%u",
+                 event->data_len_chg.conn_handle, event->data_len_chg.max_tx_octets,
+                 event->data_len_chg.max_rx_octets);
+    } else if (event->type == BLE_GAP_EVENT_NOTIFY_TX && event->notify_tx.status != 0) {
+        // Do not synchronously print every retry on the time-sensitive TX path.
+        // Persistent failures and accumulated retries are reported by the worker.
+        ESP_LOGD(TAG, "Notify rejected conn=%u handle=%u rc=%d", event->notify_tx.conn_handle,
+                 event->notify_tx.attr_handle, event->notify_tx.status);
     }
     return 0;
 }
@@ -499,6 +683,10 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 esp_err_t vokie_ble_start(void)
 {
     if (s_started) return ESP_OK;
+    // Per-frame NimBLE INFO traffic hides failures and adds console work to the
+    // audio path. Keep our bounded session/connection diagnostics instead.
+    esp_log_level_set("NimBLE", ESP_LOG_WARN);
+    ESP_LOGI(TAG, "BLE audio transport: bounded TX retries and link tuning");
     esp_err_t err = bsp_audio_init();
     if (err != ESP_OK) return err;
     // The worker owns stream open/close as well as all PCM I/O.
